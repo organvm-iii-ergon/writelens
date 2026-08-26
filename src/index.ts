@@ -163,10 +163,17 @@ function eventKey(eventId: string): string {
 
 async function rateCheckIp(ip: string, env: Env): Promise<{ allowed: boolean; remaining: number }> {
   const key = `rl:${ip}:${new Date().toISOString().slice(0, 10)}`;
-  const cur = Number(await env.WL_RATE.get(key) ?? 0);
-  if (cur >= FREE_DAILY_LIMIT) return { allowed: false, remaining: 0 };
-  await env.WL_RATE.put(key, String(cur + 1), { expirationTtl: 60 * 60 * 26 });
-  return { allowed: true, remaining: FREE_DAILY_LIMIT - cur - 1 };
+  try {
+    const cur = Number(await env.WL_RATE.get(key) ?? 0);
+    if (cur >= FREE_DAILY_LIMIT) return { allowed: false, remaining: 0 };
+    await env.WL_RATE.put(key, String(cur + 1), { expirationTtl: 60 * 60 * 26 });
+    return { allowed: true, remaining: FREE_DAILY_LIMIT - cur - 1 };
+  } catch {
+    // KV unavailable (e.g. the free-tier daily put() cap is hit) — fail OPEN.
+    // A rate limiter exists to protect the expensive call; it must never be the
+    // thing that takes the endpoint down. Allow the request when bookkeeping fails.
+    return { allowed: true, remaining: FREE_DAILY_LIMIT };
+  }
 }
 
 async function getKeyRecord(rawKey: string, env: Env): Promise<KeyRecord | null> {
@@ -897,10 +904,30 @@ async function handleLegacyConfirm(req: Request, env: Env): Promise<Response> {
   }, { status: 410 });
 }
 
+// WriteLens is meant to be embedded ("a single endpoint your product calls"),
+// so /v1/score must be callable from browser JS on other origins (e.g. the
+// studio landing page). Scope CORS to the scoring endpoint only; key/billing
+// routes stay same-origin.
+const CORS_HEADERS: Record<string, string> = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-API-Key',
+  'Access-Control-Max-Age': '86400',
+};
+
+function withCors(resp: Response): Response {
+  const h = new Headers(resp.headers);
+  for (const [k, v] of Object.entries(CORS_HEADERS)) h.set(k, v);
+  return new Response(resp.body, { status: resp.status, statusText: resp.statusText, headers: h });
+}
+
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
-    if (url.pathname === '/v1/score') return handleScore(req, env);
+    if (url.pathname === '/v1/score') {
+      if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS_HEADERS });
+      return withCors(await handleScore(req, env));
+    }
     if (url.pathname === '/api/key/request') return handleKeyRequest(req, env);
     if (url.pathname === '/api/subscribe') return handleSubscribe(req, env);
     if (url.pathname === '/api/checkout/claim') return handleCheckoutClaim(req, env);
